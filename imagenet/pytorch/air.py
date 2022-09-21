@@ -13,14 +13,14 @@ from torchvision.models import resnet50, ResNet50_Weights
 
 from theoretical import BATCH_SIZE
 
-CACHED_DATASET_PATH = "/tmp/cached_ds.parquet"
+CACHED_DATASET_PATH = "/tmp/cached_ds"
 
 @click.command("Run GPU batch prediction for image classification.")
-@click.option("--separate-stages", type=bool, default=True, help="If set, calculate times for each stage separately. Avoids all Dataset lazy execution and stage fusion. Useful for benchmarking stages independently.")
-@click.option("--predict-only", type=bool, default=False, help="If set, use cached preprocessed dataset. Useful for benchmarking only prediction.")
+@click.option("--separate-stages", type=bool, default=False, is_flag=True, help="If set, calculate times for each stage separately. Avoids all Dataset lazy execution and stage fusion. Useful for benchmarking stages independently.")
+@click.option("--predict-only", type=bool, default=False, is_flag=True, help="If set, use cached preprocessed dataset. Useful for benchmarking only prediction.")
 def main(separate_stages, predict_only):
+    ray.init(runtime_env={"working_dir": ".", "excludes": ["/imagenet/data"]})
     stage_times = {"read": 0.0, "preprocess": 0.0, "predict": 0.0}
-    start_time = time.time()
     if predict_only:
         if not os.path.exists(CACHED_DATASET_PATH):
             raise ValueError("Attempting to use cached preprocessed dataset, but it does not exist. To create the cached dataset, first run benchmarking with the --separate-stages flag.")
@@ -29,7 +29,7 @@ def main(separate_stages, predict_only):
     else:
         read_time_start = time.time()
         ds = ray.data.read_datasource(
-            ImageFolderDatasource(), root="/home/ray/batch-prediction-benchmark/imagenet/data")
+            ImageFolderDatasource(), root="/home/ray/batch-prediction-benchmark/imagenet/data", parallelism=20) # Manually set parallelism so blocks are larger and we can use larger batch size.
 
         read_time_end = time.time()
         if separate_stages:
@@ -52,7 +52,8 @@ def main(separate_stages, predict_only):
                     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], inplace=False),
                 ]
             )
-            processed_image_df = pd.DataFrame({"image": [preprocess(image).numpy() for image in df["image"]]})
+            preprocessed_images = [preprocess(image).numpy() for image in df["image"]]
+            processed_image_df = pd.DataFrame({"image": preprocessed_images})
             return processed_image_df
 
         preprocess_time_start = time.time()
@@ -68,25 +69,28 @@ def main(separate_stages, predict_only):
             preprocessor = None
 
         stage_times["preprocess"] = preprocess_time_end - preprocess_time_start
-
+    
     model = resnet50(weights=ResNet50_Weights.DEFAULT)
     ckpt = TorchCheckpoint.from_model(model=model, preprocessor=preprocessor)
     prediction_time_start = time.time()
     predictor = BatchPredictor.from_checkpoint(ckpt, TorchPredictor)
     predictor.predict(ds, num_gpus_per_worker=1, feature_columns=["image"], batch_size=BATCH_SIZE)
+    
     prediction_time_end = time.time()
     stage_times["predict"] = prediction_time_end - prediction_time_start
 
+    total_images = ds.count()
+    
     if separate_stages:
         print("Times for each stage: ", stage_times)
+        print("Throughput for each stage: ", {k: f"{total_images/v} (img/sec)" for k, v in stage_times.items()})
     
     overall_time = sum(stage_times.values())
     print("Total time: ", overall_time)
-    print(f"Throughput {ds.count() / overall_time} (img/sec)")
+    print(f"Throughput {total_images / overall_time} (img/sec)")
 
 if __name__ == "__main__":
     main()
-
 
 
 
